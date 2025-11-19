@@ -18,7 +18,6 @@ from bleak.backends.device import BLEDevice
 DFU_SERVICE_UUID = "00001530-1212-efde-1523-785feabcd123"
 DFU_CONTROL_POINT_UUID = "00001531-1212-efde-1523-785feabcd123"
 DFU_PACKET_UUID = "00001532-1212-efde-1523-785feabcd123"
-DFU_VERSION_UUID = "00001534-1212-efde-1523-785feabcd123"
 
 # --- Op Codes ---
 OP_CODE_START_DFU = 0x01
@@ -65,6 +64,9 @@ class NordicLegacyDFU:
         self.response_queue = asyncio.Queue()
         self.pkg_receipt_event = asyncio.Event()
         self.bytes_sent = 0
+
+        # Critical flag to handle the Reset Race Condition
+        self.reset_in_progress = False
 
     def parse_zip(self):
         if not os.path.exists(self.zip_path):
@@ -136,13 +138,14 @@ class NordicLegacyDFU:
                 try:
                     await client.write_gatt_char(DFU_CONTROL_POINT_UUID, payload, response=True)
                 except Exception:
-                    pass
+                    pass # Ignore errors here, device resets immediately
                 logger.info("Jump command sent.")
         except Exception as e:
             logger.info(f"Jump connection sequence ended: {e}")
 
     async def perform_update(self, device: BLEDevice):
         logger.info(f"Target Bootloader: {device.address}")
+        self.reset_in_progress = False
 
         max_retries = 3
         for attempt in range(max_retries):
@@ -154,6 +157,7 @@ class NordicLegacyDFU:
 
                     # --- STABILIZE ---
                     await client.start_notify(DFU_CONTROL_POINT_UUID, self._notification_handler)
+                    # Clear queue
                     while not self.response_queue.empty(): self.response_queue.get_nowait()
 
                     # --- STEP 1: START DFU ---
@@ -162,7 +166,6 @@ class NordicLegacyDFU:
                     await client.write_gatt_char(DFU_CONTROL_POINT_UUID, start_payload, response=True)
 
                     if self.packet_delay > 0:
-                        logger.debug(f"Pausing {self.packet_delay}s for device state switch...")
                         await asyncio.sleep(self.packet_delay)
 
                     sd_size = 0
@@ -171,8 +174,6 @@ class NordicLegacyDFU:
                     size_payload = struct.pack('<III', sd_size, bl_size, app_size)
 
                     logger.info(f"Sending Size: {app_size} bytes")
-                    logger.debug(f">> TX Size: {size_payload.hex()}")
-
                     await client.write_gatt_char(DFU_PACKET_UUID, size_payload, response=False)
 
                     # 60s timeout for Flash Erase
@@ -219,30 +220,25 @@ class NordicLegacyDFU:
                     # --- STEP 8: ACTIVATE AND RESET ---
                     logger.info("Activating & Resetting...")
 
-                    try:
-                        # We try to write with response=True to ensure it sends.
-                        # However, if the device resets immediately, this write will raise an exception.
-                        # This exception acts as our confirmation of reset.
-                        await client.write_gatt_char(
-                            DFU_CONTROL_POINT_UUID,
-                            bytearray([OP_CODE_ACTIVATE_AND_RESET]),
-                            response=True
-                        )
-                        # If we reached here, the device is polite and sent an ACK before resetting.
-                        logger.info("Reset command acknowledged.")
-                    except (BleakError, asyncio.TimeoutError) as e:
-                        # If we crash here, it usually means the device reset immediately upon receiving the byte.
-                        # This is actually a SUCCESS condition for Nordic DFU.
-                        logger.debug(f"Reset confirmed via disconnection/timeout: {e}")
+                    # !!! CRITICAL FIX !!!
+                    # We set this flag. Any error after this point is treated as success.
+                    self.reset_in_progress = True
 
-                    logger.info("DFU Complete. Device is rebooting.")
+                    # Send reset. response=True is "best effort".
+                    # Many devices reset before sending the response.
+                    await client.write_gatt_char(DFU_CONTROL_POINT_UUID, bytearray([OP_CODE_ACTIVATE_AND_RESET]), response=True)
 
-                    # STOP RETRYING - We are done.
-                    # Force a return here to break the retry loop and exit the `async with` block
-                    return
+                    logger.info("DFU Complete.")
+                    return # SUCCESS
 
             except Exception as e:
+                # Check if this error occurred AFTER we triggered the reset
+                if self.reset_in_progress:
+                    logger.info(f"Device disconnected during reset (Expected). Update Successful.")
+                    return # SUCCESS
+
                 logger.error(f"Attempt {attempt+1} failed: {e}")
+
                 if attempt < max_retries - 1:
                     logger.info("Retrying in 3s...")
                     await asyncio.sleep(3.0)
