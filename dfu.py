@@ -114,7 +114,6 @@ class NordicLegacyDFU:
             request_op, status = await asyncio.wait_for(self.response_queue.get(), timeout)
             if request_op != expected_op_code:
                 logger.debug(f"Ignored unexpected response: {request_op:#02x}")
-                # In a real scenario we might loop here, but keeping it simple
                 return -1
 
             if status != 1: # 1 = SUCCESS
@@ -139,9 +138,12 @@ class NordicLegacyDFU:
                 except Exception:
                     pass
                 logger.info("Jump command sent.")
+                # Clean disconnect to encourage device reset
+                try: await client.disconnect()
+                except: pass
                 await asyncio.sleep(0.5)
         except Exception as e:
-            logger.info(f"Jump connection sequence ended (likely success): {e}")
+            logger.info(f"Jump connection sequence ended: {e}")
 
     async def perform_update(self, device: BLEDevice):
         logger.info(f"Target Bootloader: {device.address}")
@@ -163,7 +165,6 @@ class NordicLegacyDFU:
                     logger.debug(f">> TX Start DFU: {start_payload.hex()}")
                     await client.write_gatt_char(DFU_CONTROL_POINT_UUID, start_payload, response=True)
 
-                    # Wait for device state switch
                     if self.packet_delay > 0:
                         logger.debug(f"Pausing {self.packet_delay}s for device state switch...")
                         await asyncio.sleep(self.packet_delay)
@@ -178,8 +179,7 @@ class NordicLegacyDFU:
 
                     await client.write_gatt_char(DFU_PACKET_UUID, size_payload, response=False)
 
-                    # CRITICAL: This verifies the flash area. On this device it takes ~17s.
-                    # We set timeout to 60s to be safe on slower adapters.
+                    # 60s timeout for Flash Erase
                     status = await self._wait_for_response(OP_CODE_START_DFU, timeout=60.0)
 
                     if status != 1:
@@ -189,14 +189,8 @@ class NordicLegacyDFU:
 
                     # --- STEP 2: INIT PACKET ---
                     logger.info("Sending Init Packet...")
-
-                    logger.debug(">> TX Init Start")
                     await client.write_gatt_char(DFU_CONTROL_POINT_UUID, bytearray([OP_CODE_INIT_DFU_PARAMS, 0x00]), response=True)
-
-                    logger.debug(f">> TX Init Data: {len(self.dat_data)} bytes")
                     await client.write_gatt_char(DFU_PACKET_UUID, self.dat_data, response=False)
-
-                    logger.debug(">> TX Init End")
                     await client.write_gatt_char(DFU_CONTROL_POINT_UUID, bytearray([OP_CODE_INIT_DFU_PARAMS, 0x01]), response=True)
 
                     status = await self._wait_for_response(OP_CODE_INIT_DFU_PARAMS)
@@ -206,12 +200,10 @@ class NordicLegacyDFU:
                     if self.prn > 0:
                         logger.info(f"Configuring PRN: {self.prn}")
                         prn_payload = bytearray([OP_CODE_PACKET_RECEIPT_NOTIF_REQ]) + struct.pack('<H', self.prn)
-                        logger.debug(f">> TX PRN: {prn_payload.hex()}")
                         await client.write_gatt_char(DFU_CONTROL_POINT_UUID, prn_payload, response=True)
 
                     # --- STEP 4: RECEIVE FIRMWARE IMAGE ---
                     logger.info("Requesting Upload...")
-                    logger.debug(">> TX Receive FW")
                     await client.write_gatt_char(DFU_CONTROL_POINT_UUID, bytearray([OP_CODE_RECEIVE_FIRMWARE_IMAGE]), response=True)
 
                     # --- STEP 5: STREAM BINARY ---
@@ -224,7 +216,6 @@ class NordicLegacyDFU:
 
                     # --- STEP 7: VALIDATE ---
                     logger.info("Validating...")
-                    logger.debug(">> TX Validate")
                     await client.write_gatt_char(DFU_CONTROL_POINT_UUID, bytearray([OP_CODE_VALIDATE]), response=True)
                     status = await self._wait_for_response(OP_CODE_VALIDATE)
                     if status != 1: raise DfuException(f"Validation failed. Status: {status}")
@@ -232,12 +223,23 @@ class NordicLegacyDFU:
                     # --- STEP 8: ACTIVATE AND RESET ---
                     logger.info("Activating & Resetting...")
                     try:
+                        # Send Reset command
                         await client.write_gatt_char(DFU_CONTROL_POINT_UUID, bytearray([OP_CODE_ACTIVATE_AND_RESET]), response=True)
+                    except Exception as e:
+                        # If we get an exception here, it usually means the device reset immediately
+                        # which is actually a success condition.
+                        logger.debug(f"Device disconnected during reset (Success): {e}")
+
+                    # EXPLICITLY DISCONNECT
+                    # Nordic devices often wait for the link to drop before triggering the reset
+                    logger.debug("Closing connection to trigger reset...")
+                    try:
+                        await client.disconnect()
                     except Exception:
                         pass
 
                     logger.info("DFU Complete.")
-                    return
+                    return # SUCCESS - Exit the retry loop
 
             except Exception as e:
                 logger.error(f"Attempt {attempt+1} failed: {e}")
@@ -317,7 +319,7 @@ async def main():
     parser.add_argument("device", help="Device Name or BLE Address")
     parser.add_argument("--scan", action="store_true", help="Force scan even if address is provided")
     parser.add_argument("--adapter", default=None, help="Bluetooth Adapter interface (Linux: hci0)")
-    parser.add_argument("--prn", type=int, default=8, help="PRN interval (default 8)")
+    parser.add_argument("--prn", type=int, default=12, help="PRN interval (default 12)")
     parser.add_argument("--delay", type=float, default=0.4, help="Start/Size Delay (default 0.4s)")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose debug logs")
 
