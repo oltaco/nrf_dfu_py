@@ -138,10 +138,6 @@ class NordicLegacyDFU:
                 except Exception:
                     pass
                 logger.info("Jump command sent.")
-                # Clean disconnect to encourage device reset
-                try: await client.disconnect()
-                except: pass
-                await asyncio.sleep(0.5)
         except Exception as e:
             logger.info(f"Jump connection sequence ended: {e}")
 
@@ -222,24 +218,28 @@ class NordicLegacyDFU:
 
                     # --- STEP 8: ACTIVATE AND RESET ---
                     logger.info("Activating & Resetting...")
-                    try:
-                        # Send Reset command
-                        await client.write_gatt_char(DFU_CONTROL_POINT_UUID, bytearray([OP_CODE_ACTIVATE_AND_RESET]), response=True)
-                    except Exception as e:
-                        # If we get an exception here, it usually means the device reset immediately
-                        # which is actually a success condition.
-                        logger.debug(f"Device disconnected during reset (Success): {e}")
 
-                    # EXPLICITLY DISCONNECT
-                    # Nordic devices often wait for the link to drop before triggering the reset
-                    logger.debug("Closing connection to trigger reset...")
                     try:
-                        await client.disconnect()
-                    except Exception:
-                        pass
+                        # We try to write with response=True to ensure it sends.
+                        # However, if the device resets immediately, this write will raise an exception.
+                        # This exception acts as our confirmation of reset.
+                        await client.write_gatt_char(
+                            DFU_CONTROL_POINT_UUID,
+                            bytearray([OP_CODE_ACTIVATE_AND_RESET]),
+                            response=True
+                        )
+                        # If we reached here, the device is polite and sent an ACK before resetting.
+                        logger.info("Reset command acknowledged.")
+                    except (BleakError, asyncio.TimeoutError) as e:
+                        # If we crash here, it usually means the device reset immediately upon receiving the byte.
+                        # This is actually a SUCCESS condition for Nordic DFU.
+                        logger.debug(f"Reset confirmed via disconnection/timeout: {e}")
 
-                    logger.info("DFU Complete.")
-                    return # SUCCESS - Exit the retry loop
+                    logger.info("DFU Complete. Device is rebooting.")
+
+                    # STOP RETRYING - We are done.
+                    # Force a return here to break the retry loop and exit the `async with` block
+                    return
 
             except Exception as e:
                 logger.error(f"Attempt {attempt+1} failed: {e}")
@@ -319,7 +319,7 @@ async def main():
     parser.add_argument("device", help="Device Name or BLE Address")
     parser.add_argument("--scan", action="store_true", help="Force scan even if address is provided")
     parser.add_argument("--adapter", default=None, help="Bluetooth Adapter interface (Linux: hci0)")
-    parser.add_argument("--prn", type=int, default=12, help="PRN interval (default 12)")
+    parser.add_argument("--prn", type=int, default=8, help="PRN interval (default 8)")
     parser.add_argument("--delay", type=float, default=0.4, help="Start/Size Delay (default 0.4s)")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose debug logs")
 
