@@ -41,8 +41,6 @@ class MsFormatter(logging.Formatter):
         return f"{t}.{int(record.msecs):03d}"
 
     def format(self, record):
-        # In verbose mode, we strip the [LEVEL] and just show Time + Message
-        # to keep the output focused on data flow.
         timestamp = self.formatTime(record)
         msg = record.getMessage()
         return f"{timestamp}  {msg}"
@@ -111,11 +109,12 @@ class NordicLegacyDFU:
                 logger.debug(f"<< RX PRN: {bytes_received}")
             self.pkg_receipt_event.set()
 
-    async def _wait_for_response(self, expected_op_code, timeout=20.0):
+    async def _wait_for_response(self, expected_op_code, timeout=30.0):
         try:
             request_op, status = await asyncio.wait_for(self.response_queue.get(), timeout)
             if request_op != expected_op_code:
                 logger.debug(f"Ignored unexpected response: {request_op:#02x}")
+                # In a real scenario we might loop here, but keeping it simple
                 return -1
 
             if status != 1: # 1 = SUCCESS
@@ -124,7 +123,7 @@ class NordicLegacyDFU:
 
             return 1
         except asyncio.TimeoutError:
-            logger.error(f"Timeout waiting for response to Op Code {expected_op_code:#02x}")
+            logger.error(f"Timeout ({timeout}s) waiting for response to Op Code {expected_op_code:#02x}")
             return -1
 
     async def jump_to_bootloader(self, device: BLEDevice):
@@ -138,7 +137,6 @@ class NordicLegacyDFU:
                 try:
                     await client.write_gatt_char(DFU_CONTROL_POINT_UUID, payload, response=True)
                 except Exception:
-                    # Device often disconnects immediately upon reset, causing an exception
                     pass
                 logger.info("Jump command sent.")
                 await asyncio.sleep(0.5)
@@ -157,10 +155,7 @@ class NordicLegacyDFU:
                     self.client = client
 
                     # --- STABILIZE ---
-                    # Enable Notifications first thing
                     await client.start_notify(DFU_CONTROL_POINT_UUID, self._notification_handler)
-
-                    # Flush queue
                     while not self.response_queue.empty(): self.response_queue.get_nowait()
 
                     # --- STEP 1: START DFU ---
@@ -168,12 +163,8 @@ class NordicLegacyDFU:
                     logger.debug(f">> TX Start DFU: {start_payload.hex()}")
                     await client.write_gatt_char(DFU_CONTROL_POINT_UUID, start_payload, response=True)
 
-                    # --- CRITICAL DELAY FOR LINUX ---
-                    # The device needs time to switch state after receiving Start DFU
-                    # before it can accept the Size Packet.
-                    # Without this, BlueZ pushes the Size packet too fast and it gets dropped.
+                    # Wait for device state switch
                     if self.packet_delay > 0:
-                        # Only log if verbose to keep non-verbose clean
                         logger.debug(f"Pausing {self.packet_delay}s for device state switch...")
                         await asyncio.sleep(self.packet_delay)
 
@@ -185,10 +176,12 @@ class NordicLegacyDFU:
                     logger.info(f"Sending Size: {app_size} bytes")
                     logger.debug(f">> TX Size: {size_payload.hex()}")
 
-                    # Write Packet (no response expected by BLE spec, but app logic expects Notif after)
                     await client.write_gatt_char(DFU_PACKET_UUID, size_payload, response=False)
 
-                    status = await self._wait_for_response(OP_CODE_START_DFU)
+                    # CRITICAL: This verifies the flash area. On this device it takes ~17s.
+                    # We set timeout to 60s to be safe on slower adapters.
+                    status = await self._wait_for_response(OP_CODE_START_DFU, timeout=60.0)
+
                     if status != 1:
                         logger.warning(f"Start DFU failed (Status {status}). Resetting...")
                         await client.write_gatt_char(DFU_CONTROL_POINT_UUID, bytearray([OP_CODE_RESET]), response=True)
@@ -263,9 +256,6 @@ class NordicLegacyDFU:
 
         logger.info(f"Uploading {total_bytes} bytes...")
 
-        # We intentionally don't use loggers inside the loop to keep speed high
-        # unless something specific happens
-
         for i in range(0, total_bytes, chunk_size):
             chunk = self.bin_data[i : i + chunk_size]
 
@@ -273,10 +263,8 @@ class NordicLegacyDFU:
             self.bytes_sent += len(chunk)
             packets_since_prn += 1
 
-            # Visual progress update (overwrite line)
             if i % 2000 == 0:
                 pct = int((self.bytes_sent / total_bytes) * 100)
-                # Print directly to stdout to bypass logger formatting for progress bar
                 sys.stdout.write(f"\rUploading: {pct}%")
                 sys.stdout.flush()
 
@@ -330,28 +318,23 @@ async def main():
     parser.add_argument("--scan", action="store_true", help="Force scan even if address is provided")
     parser.add_argument("--adapter", default=None, help="Bluetooth Adapter interface (Linux: hci0)")
     parser.add_argument("--prn", type=int, default=8, help="PRN interval (default 8)")
-    # Increased default delay for Linux stability
     parser.add_argument("--delay", type=float, default=0.4, help="Start/Size Delay (default 0.4s)")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose debug logs")
 
     args = parser.parse_args()
 
-    # Configure Logger
     handler = logging.StreamHandler()
-
     if args.verbose:
-        # Verbose: Millisecond timestamp + Message
         handler.setFormatter(MsFormatter())
         logger.setLevel(logging.DEBUG)
-        logging.getLogger("bleak").setLevel(logging.WARNING) # Keep bleak quiet
+        logging.getLogger("bleak").setLevel(logging.WARNING)
     else:
-        # Normal: Standard formatting
         handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S"))
         logger.setLevel(logging.INFO)
         logging.getLogger("bleak").setLevel(logging.ERROR)
 
     logger.addHandler(handler)
-    logger.propagate = False # Prevent double logging
+    logger.propagate = False
 
     try:
         dfu = NordicLegacyDFU(args.file, args.prn, args.delay, adapter=args.adapter)
@@ -371,7 +354,6 @@ async def main():
             pass
 
         if not bootloader_device:
-            # Address guessing fallback
             original_mac = app_device.address
             if ":" in original_mac and len(original_mac) == 17:
                 try:
