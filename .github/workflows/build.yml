@@ -24,7 +24,7 @@ jobs:
             artifact_name: NordicDFU
             asset_name: NordicDFU-Linux-x64
 
-          - os: macos-13      # Intel Mac
+          - os: macos-14      # Intel Mac
             arch: x64
             artifact_name: NordicDFU.app
             asset_name: NordicDFU-macOS-Intel.zip
