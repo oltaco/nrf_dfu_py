@@ -19,7 +19,7 @@ jobs:
             artifact_name: NordicDFU-Windows-x64.exe
             asset_name: NordicDFU-Windows-x64.exe
 
-          - os: ubuntu-20.04  # Use older Ubuntu for better compatibility (glibc)
+          - os: ubuntu-22.04 # Intel/Linux
             arch: x64
             artifact_name: NordicDFU
             asset_name: NordicDFU-Linux-x64
