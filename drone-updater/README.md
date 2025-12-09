@@ -1,5 +1,5 @@
 ## Flash update MeshCore from drone + rpi zero 2w
-1. flash raspbian
+1. flash raspbian lite
 2. `sudo git clone https://github.com/recrof/nrf_dfu_py/ /opt/nrf_dfu_py`
 3. copy `dfu_service.sh` to `/opt/nrf_dfu_py`, `sudo chmod +x dfu_service.sh`
 4. copy `nrf_dfu.service` to `/etc/systemd/system/`
