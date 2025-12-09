@@ -25,6 +25,9 @@ This project has been split into a modular library, a Command Line Interface (CL
 *   A Bluetooth Low Energy (BLE) adapter.
 
 ## Installation
+Download pre-built GUI binary from [releases](https://github.com/recrof/nrf_dfu_py/releases)
+
+or
 
 1.  **Clone or download this repository.**
 2.  **Install Python dependencies:**
@@ -41,7 +44,6 @@ pip install bleak
 ## Usage
 
 ### 1. Graphical User Interface (GUI)
-
 The GUI allows you to scan for devices, filter by signal strength (RSSI), and configure settings visually.
 
 ```bash
