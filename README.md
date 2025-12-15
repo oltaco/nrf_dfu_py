@@ -39,9 +39,9 @@ pip install bleak
 ```
 
 3.  **Linux Users Only:** You may need to install Tkinter explicitly for the GUI:
-    ```bash
-    sudo apt-get install python3-tk
-    ```
+ ```bash
+ sudo apt-get install python3-tk
+ ```
 
 ## Usage
 
