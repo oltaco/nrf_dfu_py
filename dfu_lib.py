@@ -123,22 +123,27 @@ class NordicLegacyDFU:
             self._log(f"Timeout ({timeout}s) waiting for response", logging.ERROR)
             return -1
 
-    async def jump_to_bootloader(self, device: BLEDevice):
+    async def jump_to_bootloader(self, device: BLEDevice, timeout: float = 10.0) -> bool:
         self._log(f"Connecting to {device.name} ({device.address}) for Jump...")
         try:
-            async with BleakClient(device, adapter=self.adapter) as client:
+            async with BleakClient(device, adapter=self.adapter, timeout=timeout) as client:
                 await client.start_notify(DFU_CONTROL_POINT_UUID, self._notification_handler)
                 self._log(f"MTU after start_notify: {client.mtu_size}")
                 payload = bytearray([OP_CODE_ENTER_BOOTLOADER, UPLOAD_MODE_APPLICATION])
 
-                logger.debug(f">> TX Jump: {payload.hex()}")
                 try:
-                    await client.write_gatt_char(DFU_CONTROL_POINT_UUID, payload, response=True)
+                    await asyncio.wait_for(client.write_gatt_char(DFU_CONTROL_POINT_UUID, payload, response=True), timeout = 2.0)
+                except asyncio.TimeoutError:
+                    pass # expected
                 except Exception:
-                    pass
+                    pass  # Expected - device resets and disconnects
                 self._log("Jump command sent.")
+                await asyncio.sleep(0.5) # let bleak cleanup
+                return True
         except Exception as e:
-            self._log(f"Jump connection sequence ended: {e}")
+            self._log(f"Jump connection failed: {e}", logging.ERROR)
+            raise DfuException(f"Failed to jump to bootloader: {e}")
+
 
     async def perform_update(self, device: BLEDevice, max_retries: int = 3):
         self._log(f"Target Bootloader: {device.address}")
@@ -146,12 +151,21 @@ class NordicLegacyDFU:
 
         for attempt in range(max_retries):
             self._log(f"DFU connection attempt {attempt+1}/{max_retries}...")
-
+            # 🔴 HARD RESET DFU STATE PER ATTEMPT
+            self.client = None
+            self.response_queue = asyncio.Queue()
+            self.pkg_receipt_event = asyncio.Event()
+            self.bytes_sent = 0
+            self.reset_in_progress = False
+            
             try:
-                async with BleakClient(device, timeout=20.0, adapter=self.adapter) as client:
+                async with BleakClient(device, timeout=10.0, adapter=self.adapter) as client:
                     self.client = client
+                    try:
+                        await client.start_notify(DFU_CONTROL_POINT_UUID, self._notification_handler)
+                    except Exception as e:
+                        raise DfuException(f"Failed to enable DFU notifications: {e}")
                     self._log(f"MTU: {client.mtu_size}")
-                    await client.start_notify(DFU_CONTROL_POINT_UUID, self._notification_handler)
                     while not self.response_queue.empty(): self.response_queue.get_nowait()
 
                     # Start DFU
@@ -225,6 +239,7 @@ class NordicLegacyDFU:
     async def _stream_firmware(self):
         chunk_size = min(self.client.mtu_size - 3, 244)  # ATT overhead, cap at 244
         self._log(f"Using chunk_size = {chunk_size}")
+        self._log(f"PRN timeout set to {max(0.5, self.prn * 0.05)} !")
         total_bytes = len(self.bin_data)
         packets_since_prn = 0
         self.bytes_sent = 0
@@ -245,7 +260,7 @@ class NordicLegacyDFU:
             if self.prn > 0 and packets_since_prn >= self.prn:
                 self.pkg_receipt_event.clear()
                 try:
-                    await asyncio.wait_for(self.pkg_receipt_event.wait(), timeout=5.0)
+                    await asyncio.wait_for(self.pkg_receipt_event.wait(), timeout = max(0.5, self.prn * 0.05))
                 except asyncio.TimeoutError:
                     self._log("PRN Timeout, continuing anyway...", logging.WARNING)
                 packets_since_prn = 0
@@ -322,3 +337,27 @@ async def find_any_device(identifiers: List[str], adapter: str = None, service_u
                 pass
 
     raise DfuException(f"No devices found matching: {identifiers}")
+    
+async def fast_find_bootloader(adapter=None, service_uuid=None, retries=10, scan_time=0.7):
+    for _ in range(retries):
+        scanner = BleakScanner(adapter=adapter)
+        scanned = await scanner.discover(timeout=scan_time, return_adv=True)
+
+        for _, (d, adv) in scanned.items():
+            if service_uuid and service_uuid.lower() in [u.lower() for u in adv.service_uuids]:
+                return d
+
+        await asyncio.sleep(0.1)
+
+    raise DfuException("Bootloader not found")
+    
+    
+def suppress_invalid_state(loop, context):
+    exc = context.get('exception')
+    if isinstance(exc, asyncio.InvalidStateError):
+        return  # Suppress
+    # Otherwise use default handling
+    loop.default_exception_handler(context)
+
+loop = asyncio.get_event_loop()
+loop.set_exception_handler(suppress_invalid_state)
