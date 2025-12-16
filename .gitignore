@@ -1,3 +1,11 @@
+.gitignore
 build
 dist
 __pycache__
+
+# python virtual environment stuff
+venv
+bin
+lib
+lib64
+pyvenv.cfg
