@@ -50,6 +50,7 @@ async def main():
     # Arguments for stress-testing
     parser.add_argument("--loop", action="store_true", help="Run DFU indefinitely with 60s delay between runs")
     parser.add_argument("--log-file", default=None, help="Log output to file")
+    parser.add_argument("--corrupt", action="store_true", help="Intentionally corrupt some packets to test CRC failure handling")
 
 
     args = parser.parse_args()
@@ -90,6 +91,7 @@ async def main():
         try:
             # Pass None for log_callback so the library uses the standard logger configured above
             dfu = NordicLegacyDFU(args.file, args.prn, args.delay, adapter=args.adapter, progress_callback=cli_progress_handler)
+            dfu.corrupt_packets = args.corrupt
             dfu.parse_zip()
 
             logger.info(f"Scanning for target(s): {args.device}...")
@@ -155,9 +157,9 @@ async def main():
             # Pass the custom retry count here
             #await dfu.perform_update(bootloader_device, max_retries=args.retry)
             try:
-                await asyncio.wait_for(dfu.perform_update(bootloader_device, max_retries=args.retry), timeout=90.0)
+                await asyncio.wait_for(dfu.perform_update(bootloader_device, max_retries=args.retry), timeout=300.0)
             except asyncio.TimeoutError:
-                logger.error("DFU timed out after 90 seconds")
+                raise DfuException("DFU timed out after 5 minutes")
 
             
             logger.info(f"Run #{run_count} completed successfully")

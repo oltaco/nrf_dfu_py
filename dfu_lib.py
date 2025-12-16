@@ -43,6 +43,7 @@ class NordicLegacyDFU:
         self.adapter = adapter
         self.progress_callback = progress_callback
         self.log_callback = log_callback
+        self.corrupt_packets = False
 
         self.manifest = None
         self.bin_data = None
@@ -159,72 +160,80 @@ class NordicLegacyDFU:
             self.reset_in_progress = False
             
             try:
-                async with BleakClient(device, timeout=10.0, adapter=self.adapter) as client:
-                    self.client = client
-                    try:
-                        await client.start_notify(DFU_CONTROL_POINT_UUID, self._notification_handler)
-                    except Exception as e:
-                        raise DfuException(f"Failed to enable DFU notifications: {e}")
-                    self._log(f"MTU: {client.mtu_size}")
-                    while not self.response_queue.empty(): self.response_queue.get_nowait()
+                async with asyncio.timeout(30.0):  # Overall attempt timeout
+                    async with BleakClient(device, timeout=10.0, adapter=self.adapter) as client:
+                        self.client = client
+                        try:
+                            await client.start_notify(DFU_CONTROL_POINT_UUID, self._notification_handler)
+                        except Exception as e:
+                            raise DfuException(f"Failed to enable DFU notifications: {e}")
+                        self._log(f"MTU: {client.mtu_size}")
+                        while not self.response_queue.empty(): self.response_queue.get_nowait()
 
-                    # Start DFU
-                    start_payload = bytearray([OP_CODE_START_DFU, UPLOAD_MODE_APPLICATION])
-                    await client.write_gatt_char(DFU_CONTROL_POINT_UUID, start_payload, response=True)
+                        # Start DFU
+                        start_payload = bytearray([OP_CODE_START_DFU, UPLOAD_MODE_APPLICATION])
+                        await client.write_gatt_char(DFU_CONTROL_POINT_UUID, start_payload, response=True)
 
-                    if self.packet_delay > 0:
-                        await asyncio.sleep(self.packet_delay)
+                        if self.packet_delay > 0:
+                            await asyncio.sleep(self.packet_delay)
 
-                    sd_size = 0
-                    bl_size = 0
-                    app_size = len(self.bin_data)
-                    size_payload = struct.pack('<III', sd_size, bl_size, app_size)
+                        sd_size = 0
+                        bl_size = 0
+                        app_size = len(self.bin_data)
+                        size_payload = struct.pack('<III', sd_size, bl_size, app_size)
 
-                    self._log(f"Sending Size: {app_size} bytes")
-                    await client.write_gatt_char(DFU_PACKET_UUID, size_payload, response=False)
+                        self._log(f"Sending Size: {app_size} bytes")
+                        await client.write_gatt_char(DFU_PACKET_UUID, size_payload, response=False)
 
-                    status = await self._wait_for_response(OP_CODE_START_DFU, timeout=60.0)
-                    if status != 1:
-                        await client.write_gatt_char(DFU_CONTROL_POINT_UUID, bytearray([OP_CODE_RESET]), response=True)
-                        raise DfuException("Start DFU sequence failed")
+                        status = await self._wait_for_response(OP_CODE_START_DFU, timeout=60.0)
+                        if status != 1:
+                            await client.write_gatt_char(DFU_CONTROL_POINT_UUID, bytearray([OP_CODE_RESET]), response=True)
+                            raise DfuException("Start DFU sequence failed")
 
-                    # Init Packet
-                    self._log("Sending Init Packet...")
-                    await client.write_gatt_char(DFU_CONTROL_POINT_UUID, bytearray([OP_CODE_INIT_DFU_PARAMS, 0x00]), response=True)
-                    await client.write_gatt_char(DFU_PACKET_UUID, self.dat_data, response=False)
-                    await client.write_gatt_char(DFU_CONTROL_POINT_UUID, bytearray([OP_CODE_INIT_DFU_PARAMS, 0x01]), response=True)
+                        # Init Packet
+                        self._log("Sending Init Packet...")
+                        await client.write_gatt_char(DFU_CONTROL_POINT_UUID, bytearray([OP_CODE_INIT_DFU_PARAMS, 0x00]), response=True)
+                        await client.write_gatt_char(DFU_PACKET_UUID, self.dat_data, response=False)
+                        await client.write_gatt_char(DFU_CONTROL_POINT_UUID, bytearray([OP_CODE_INIT_DFU_PARAMS, 0x01]), response=True)
 
-                    status = await self._wait_for_response(OP_CODE_INIT_DFU_PARAMS)
-                    if status != 1: raise DfuException(f"Init Packet failed. Status: {status}")
+                        status = await self._wait_for_response(OP_CODE_INIT_DFU_PARAMS)
+                        if status != 1: raise DfuException(f"Init Packet failed. Status: {status}")
 
-                    # PRN
-                    if self.prn > 0:
-                        self._log(f"Configuring PRN: {self.prn}")
-                        prn_payload = bytearray([OP_CODE_PACKET_RECEIPT_NOTIF_REQ]) + struct.pack('<H', self.prn)
-                        await client.write_gatt_char(DFU_CONTROL_POINT_UUID, prn_payload, response=True)
+                        # PRN
+                        if self.prn > 0:
+                            self._log(f"Configuring PRN: {self.prn}")
+                            prn_payload = bytearray([OP_CODE_PACKET_RECEIPT_NOTIF_REQ]) + struct.pack('<H', self.prn)
+                            await client.write_gatt_char(DFU_CONTROL_POINT_UUID, prn_payload, response=True)
 
-                    # Stream
-                    self._log("Requesting Upload...")
-                    await client.write_gatt_char(DFU_CONTROL_POINT_UUID, bytearray([OP_CODE_RECEIVE_FIRMWARE_IMAGE]), response=True)
-                    await self._stream_firmware()
+                        # Stream
+                        self._log("Requesting Upload...")
+                        await client.write_gatt_char(DFU_CONTROL_POINT_UUID, bytearray([OP_CODE_RECEIVE_FIRMWARE_IMAGE]), response=True)
+                        await self._stream_firmware()
 
-                    # Validate
-                    self._log("Verifying Upload...")
-                    flash_write_timeout = max(60.0, len(self.bin_data) / 50000) # Longer timeout for flash write completion - ~1s per 50KB
-                    status = await self._wait_for_response(OP_CODE_RECEIVE_FIRMWARE_IMAGE, timeout=flash_write_timeout)
-                    if status != 1: raise DfuException(f"Upload failed. Status: {status}")
+                        # Validate
+                        self._log("Verifying Upload...")
+                        flash_write_timeout = max(60.0, len(self.bin_data) / 50000) # Longer timeout for flash write completion - ~1s per 50KB
+                        status = await self._wait_for_response(OP_CODE_RECEIVE_FIRMWARE_IMAGE, timeout=flash_write_timeout)
+                        if status != 1: raise DfuException(f"Upload failed. Status: {status}")
 
-                    self._log("Validating...")
-                    await client.write_gatt_char(DFU_CONTROL_POINT_UUID, bytearray([OP_CODE_VALIDATE]), response=True)
-                    status = await self._wait_for_response(OP_CODE_VALIDATE)
-                    if status != 1: raise DfuException(f"Validation failed. Status: {status}")
+                        self._log("Validating...")
+                        await client.write_gatt_char(DFU_CONTROL_POINT_UUID, bytearray([OP_CODE_VALIDATE]), response=True)
+                        status = await self._wait_for_response(OP_CODE_VALIDATE)
+                        if status != 1: raise DfuException(f"Validation failed. Status: {status}")
 
-                    # Reset
-                    self._log("Activating & Resetting...")
-                    self.reset_in_progress = True
-                    await client.write_gatt_char(DFU_CONTROL_POINT_UUID, bytearray([OP_CODE_ACTIVATE_AND_RESET]), response=True)
-                    self._log("DFU Complete.")
-                    return # SUCCESS
+                        # Reset
+                        self._log("Activating & Resetting...")
+                        self.reset_in_progress = True
+                        await client.write_gatt_char(DFU_CONTROL_POINT_UUID, bytearray([OP_CODE_ACTIVATE_AND_RESET]), response=True)
+                        self._log("DFU Complete.")
+                        return # SUCCESS
+                    
+            except asyncio.TimeoutError:
+                self._log(f"Attempt {attempt+1} timed out", logging.ERROR)
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(3.0)
+                else:
+                    raise DfuException("DFU timed out after all retries")
 
             except Exception as e:
                 if self.reset_in_progress:
@@ -236,6 +245,7 @@ class NordicLegacyDFU:
                 else:
                     raise e
 
+
     async def _stream_firmware(self):
         chunk_size = min(self.client.mtu_size - 3, 244)  # ATT overhead, cap at 244
         self._log(f"Using chunk_size = {chunk_size}")
@@ -243,14 +253,21 @@ class NordicLegacyDFU:
         total_bytes = len(self.bin_data)
         packets_since_prn = 0
         self.bytes_sent = 0
+        packets_sent = 0
+
 
         self._log(f"Uploading {total_bytes} bytes...")
 
         for i in range(0, total_bytes, chunk_size):
-            chunk = self.bin_data[i : i + chunk_size]
+            chunk = bytearray(self.bin_data[i : i + chunk_size])
+            # Corrupt a few packets mid-transfer
+            if self.corrupt_packets and packets_sent in (100, 200, 300):
+                chunk[0] ^= 0xFF  # Flip bits in first byte
+                self._log(f"Corrupted packet #{packets_sent}", logging.WARNING)
             await self.client.write_gatt_char(DFU_PACKET_UUID, chunk, response=False)
             self.bytes_sent += len(chunk)
             packets_since_prn += 1
+            packets_sent += 1
 
             if i % 2000 == 0 or i == 0:
                 pct = int((self.bytes_sent / total_bytes) * 100)
