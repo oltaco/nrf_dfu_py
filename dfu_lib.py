@@ -128,6 +128,7 @@ class NordicLegacyDFU:
         self._log(f"Connecting to {device.name} ({device.address}) for Jump...")
         try:
             async with BleakClient(device, adapter=self.adapter, timeout=timeout) as client:
+                self._log(f"Services: {[s.uuid for s in client.services]}")
                 await client.start_notify(DFU_CONTROL_POINT_UUID, self._notification_handler)
                 self._log(f"MTU after start_notify: {client.mtu_size}")
                 payload = bytearray([OP_CODE_ENTER_BOOTLOADER, UPLOAD_MODE_APPLICATION])
@@ -160,7 +161,7 @@ class NordicLegacyDFU:
             self.reset_in_progress = False
             
             try:
-                async with asyncio.timeout(30.0):  # Overall attempt timeout
+                async with asyncio.timeout(300.0):  # 5 minutes maximum per attempt.
                     async with BleakClient(device, timeout=10.0, adapter=self.adapter) as client:
                         self.client = client
                         try:
@@ -356,11 +357,13 @@ async def find_any_device(identifiers: List[str], adapter: str = None, service_u
     raise DfuException(f"No devices found matching: {identifiers}")
     
 async def fast_find_bootloader(adapter=None, service_uuid=None, retries=10, scan_time=0.7):
+
     for _ in range(retries):
         scanner = BleakScanner(adapter=adapter)
         scanned = await scanner.discover(timeout=scan_time, return_adv=True)
 
         for _, (d, adv) in scanned.items():
+            logger.debug(f"Scanned: {d.name} ({d.address}) services={adv.service_uuids}")
             if service_uuid and service_uuid.lower() in [u.lower() for u in adv.service_uuids]:
                 return d
 
