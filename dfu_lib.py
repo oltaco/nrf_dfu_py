@@ -162,7 +162,7 @@ class NordicLegacyDFU:
             
             try:
                 async with asyncio.timeout(300.0):  # 5 minutes maximum per attempt.
-                    async with BleakClient(device, timeout=10.0, adapter=self.adapter) as client:
+                    async with BleakClient(device, timeout=15.0, adapter=self.adapter) as client:
                         self.client = client
                         try:
                             await client.start_notify(DFU_CONTROL_POINT_UUID, self._notification_handler)
