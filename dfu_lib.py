@@ -5,6 +5,7 @@ import struct
 import zipfile
 import json
 import os
+import warnings
 from typing import Optional, Callable, List
 
 from bleak import BleakScanner, BleakClient, BleakError
@@ -65,6 +66,25 @@ class NordicLegacyDFU:
 
         if self.log_callback:
             self.log_callback(msg)
+
+    async def _setup_mtu(self):
+        if not self.client:
+            return 23
+
+        if hasattr(self.client, "_backend"):
+            if hasattr(self.client._backend, "_acquire_mtu"):
+                try:
+                    await self.client._backend._acquire_mtu()
+                except Exception:
+                    pass
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            try:
+                mtu = self.client.mtu_size
+            except:
+                mtu = 23
+        return mtu
 
     def parse_zip(self):
         if not os.path.exists(self.zip_path):
@@ -127,8 +147,11 @@ class NordicLegacyDFU:
         self._log(f"Connecting to {device.name} ({device.address}) for Jump...")
         try:
             async with BleakClient(device, adapter=self.adapter) as client:
+                self.client = client
                 await client.start_notify(DFU_CONTROL_POINT_UUID, self._notification_handler)
-                self._log(f"MTU after start_notify: {client.mtu_size}")
+                mtu = await self._setup_mtu()
+                self._log(f"Connected. MTU: {mtu}")
+
                 payload = bytearray([OP_CODE_ENTER_BOOTLOADER, UPLOAD_MODE_APPLICATION])
 
                 logger.debug(f">> TX Jump: {payload.hex()}")
@@ -150,8 +173,12 @@ class NordicLegacyDFU:
             try:
                 async with BleakClient(device, timeout=20.0, adapter=self.adapter) as client:
                     self.client = client
-                    self._log(f"MTU: {client.mtu_size}")
+
                     await client.start_notify(DFU_CONTROL_POINT_UUID, self._notification_handler)
+
+                    mtu = await self._setup_mtu()
+                    self._log(f"Connected to Bootloader. MTU: {mtu}")
+
                     while not self.response_queue.empty(): self.response_queue.get_nowait()
 
                     # Start DFU
@@ -223,7 +250,12 @@ class NordicLegacyDFU:
                     raise e
 
     async def _stream_firmware(self):
-        chunk_size = min(self.client.mtu_size - 3, 244)  # ATT overhead, cap at 244
+        # Suppress warning when reading MTU for chunk calculation
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            mtu = self.client.mtu_size if self.client else 23
+        chunk_size = min(mtu - 3, 244)  # ATT overhead, cap at 244
+        if chunk_size < 20: chunk_size = 20
         self._log(f"Using chunk_size = {chunk_size}")
         total_bytes = len(self.bin_data)
         packets_since_prn = 0
@@ -254,14 +286,11 @@ class NordicLegacyDFU:
             self.progress_callback(100)
 
 async def scan_for_devices(adapter: str = None) -> List[BLEDevice]:
-    """Returns a list of all found devices (simple scan)."""
+
     scanner = BleakScanner(adapter=adapter)
     return await scanner.discover(timeout=5.0)
 
 async def find_device_by_name_or_address(name_or_address: str, force_scan: bool, adapter: str = None, service_uuid: str = None) -> BLEDevice:
-    """
-    Helper to find a specific device.
-    """
     if not force_scan and not adapter:
         try:
             device = await BleakScanner.find_device_by_address(name_or_address, timeout=10.0)
@@ -292,33 +321,21 @@ async def find_device_by_name_or_address(name_or_address: str, force_scan: bool,
     return target
 
 async def find_any_device(identifiers: List[str], adapter: str = None, service_uuid: str = None) -> BLEDevice:
-    """
-    Scans once and checks if ANY of the provided identifiers match found devices.
-    Returns the first device that matches.
-    """
     scanner = BleakScanner(adapter=adapter)
-    # Perform a single broadcast scan
     scanned_devices = await scanner.discover(timeout=5.0, return_adv=True)
 
     for identifier in identifiers:
         identifier_upper = identifier.upper()
 
         for key, (d, adv) in scanned_devices.items():
-            # 1. Check Address Match
             if d.address.upper() == identifier_upper:
                 return d
 
-            # 2. Check Name Match
             adv_name = adv.local_name or d.name or ""
             if adv_name == identifier:
                 return d
 
-            # 3. Check Service UUID (only if identifier matches special UUID string if applicable)
-            # (Logic handled separately usually, but here checking generally)
             if service_uuid and service_uuid.lower() in [u.lower() for u in adv.service_uuids]:
-                # This is a bit ambiguous if multiple devices have the UUID,
-                # but this function targets specific identifiers.
-                # If identifier was "DFU_SERVICE", it would catch here.
                 pass
 
     raise DfuException(f"No devices found matching: {identifiers}")
