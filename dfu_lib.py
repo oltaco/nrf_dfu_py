@@ -260,6 +260,8 @@ class NordicLegacyDFU:
         total_bytes = len(self.bin_data)
         packets_since_prn = 0
         self.bytes_sent = 0
+        prn_timeout = max(0.8, self.prn * 0.08) # Estimate timeout based on PRN
+        self._log(f"PRN Timeout set to {prn_timeout:.2f} seconds")
 
         self._log(f"Uploading {total_bytes} bytes...")
 
@@ -277,7 +279,7 @@ class NordicLegacyDFU:
             if self.prn > 0 and packets_since_prn >= self.prn:
                 self.pkg_receipt_event.clear()
                 try:
-                    await asyncio.wait_for(self.pkg_receipt_event.wait(), timeout=5.0)
+                    await asyncio.wait_for(self.pkg_receipt_event.wait(), timeout=prn_timeout)
                 except asyncio.TimeoutError:
                     self._log("PRN Timeout, continuing anyway...", logging.WARNING)
                 packets_since_prn = 0
